@@ -1,297 +1,169 @@
-use std::fs;
-use std::io;
-use std::path::{Path, PathBuf};
-use clap::{Parser, ArgAction};
-use std::fmt;
+mod cli;
+mod progress;
+mod render;
+mod scan;
+mod size;
 
-// Define command line arguments using clap
-#[derive(Parser, Debug)]
-#[command(name = "sizetree")]
-#[command(about = "Display directory sizes in a tree-like format", long_about = None)]
-struct Args {
-    /// Directory to analyze (defaults to current directory)
-    #[arg(default_value = ".")]
-    directory: PathBuf,
+use std::io::{self, BufWriter, IsTerminal, Write};
+use std::num::NonZeroUsize;
+use std::process::ExitCode;
+use std::sync::atomic::Ordering;
+use std::time::Instant;
 
-    /// Maximum depth to display
-    #[arg(long, value_name = "N")]
-    depth: Option<usize>,
+use anstream::{ColorChoice, eprintln};
+use anstyle::{AnsiColor, Style};
+use anyhow::{Context, Result};
+use clap::Parser;
 
-    /// Minimum size to display (e.g. 1MB, 500KB)
-    #[arg(long, value_name = "SIZE", default_value = "0")]
-    min_size: String,
+use crate::cli::{Cli, SortKey};
+use crate::render::{JsonNode, JsonReport, TextOptions, ViewOptions, group_digits};
+use crate::scan::{ScanOptions, ScanResult, Stats};
+use crate::size::format_size;
 
-    /// Sort by name instead of size
-    #[arg(long, action = ArgAction::SetTrue)]
-    sort_name: bool,
-}
+/// Scanning recurses once per directory level; give worker threads room for
+/// very deep trees.
+const SCAN_STACK_SIZE: usize = 32 * 1024 * 1024;
 
-struct FileInfo {
-    path: PathBuf,
-    size: u64,
-    is_dir: bool,
-}
+const ERROR: Style = Style::new()
+    .fg_color(Some(anstyle::Color::Ansi(AnsiColor::Red)))
+    .bold();
+const WARNING: Style = Style::new()
+    .fg_color(Some(anstyle::Color::Ansi(AnsiColor::Yellow)))
+    .bold();
+const DIM: Style = Style::new().dimmed();
 
-#[derive(Debug)]
-enum SizeError {
-    ParseError(String),
-    IoError(io::Error),
-}
+fn main() -> ExitCode {
+    let cli = Cli::parse();
+    ColorChoice::from(cli.color).write_global();
 
-impl fmt::Display for SizeError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            SizeError::ParseError(msg) => write!(f, "Size parsing error: {}", msg),
-            SizeError::IoError(err) => write!(f, "I/O error: {}", err),
+    match run(&cli) {
+        Ok(()) => ExitCode::SUCCESS,
+        // The reader went away (e.g. `sizetree | head`): not an error.
+        Err(err) if is_broken_pipe(&err) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("{ERROR}error:{ERROR:#} {err:#}");
+            ExitCode::FAILURE
         }
     }
 }
 
-impl From<io::Error> for SizeError {
-    fn from(error: io::Error) -> Self {
-        SizeError::IoError(error)
-    }
-}
+fn run(cli: &Cli) -> Result<()> {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(cli.threads.map_or(0, NonZeroUsize::get))
+        .stack_size(SCAN_STACK_SIZE)
+        .build_global()
+        .context("failed to start worker threads")?;
 
-impl std::error::Error for SizeError {}
-
-fn get_size(path: &Path) -> Result<u64, SizeError> {
-    match fs::metadata(path) {
-        Ok(metadata) => {
-            if metadata.is_dir() {
-                let mut total_size = 0;
-                
-                // Read the directory silently ignoring errors
-                if let Ok(entries) = fs::read_dir(path) {
-                    for entry_result in entries {
-                        if let Ok(entry) = entry_result {
-                            // Silently ignore errors
-                            if let Ok(size) = get_size(&entry.path()) {
-                                total_size += size;
-                            }
-                        }
-                    }
-                }
-                Ok(total_size)
-            } else {
-                Ok(metadata.len())
-            }
-        },
-        Err(err) => Err(SizeError::IoError(err)) // Propagate the error without printing it
-    }
-}
-
-fn format_size(size: u64) -> String {
-    const KB: u64 = 1024;
-    const MB: u64 = KB * 1024;
-    const GB: u64 = MB * 1024;
-
-    if size >= GB {
-        format!("{:.2} GB", size as f64 / GB as f64)
-    } else if size >= MB {
-        format!("{:.2} MB", size as f64 / MB as f64)
-    } else if size >= KB {
-        format!("{:.2} KB", size as f64 / KB as f64)
-    } else {
-        format!("{} B", size)
-    }
-}
-
-fn parse_size(size_str: &str) -> Result<u64, SizeError> {
-    let size_str = size_str.trim().to_uppercase();
-    
-    if size_str.is_empty() {
-        return Err(SizeError::ParseError("Empty size string".to_string()));
-    }
-    
-    let (num_str, unit) = if size_str.ends_with("KB") {
-        (&size_str[..size_str.len() - 2], "KB")
-    } else if size_str.ends_with("MB") {
-        (&size_str[..size_str.len() - 2], "MB")
-    } else if size_str.ends_with("GB") {
-        (&size_str[..size_str.len() - 2], "GB")
-    } else if size_str.ends_with("B") {
-        (&size_str[..size_str.len() - 1], "B")
-    } else if size_str.ends_with("K") {
-        (&size_str[..size_str.len() - 1], "KB")
-    } else if size_str.ends_with("M") {
-        (&size_str[..size_str.len() - 1], "MB")
-    } else if size_str.ends_with("G") {
-        (&size_str[..size_str.len() - 1], "GB")
-    } else {
-        (size_str.as_str(), "B")
+    let scan_opts = ScanOptions {
+        apparent_size: cli.apparent_size,
+        one_file_system: cli.one_file_system,
+        max_depth: cli.depth,
+        exclude: cli.exclude.clone(),
     };
-    
-    let num = num_str.parse::<f64>()
-        .map_err(|_| SizeError::ParseError(format!("Invalid number: {}", num_str)))?;
-    
-    let multiplier = match unit {
-        "KB" => 1024,
-        "MB" => 1024 * 1024,
-        "GB" => 1024 * 1024 * 1024,
-        "B" => 1,
-        _ => return Err(SizeError::ParseError(format!("Unknown unit: {}", unit))),
-    };
-    
-    Ok((num * multiplier as f64) as u64)
-}
+    let stats = Stats::default();
+    let show_progress = io::stderr().is_terminal() && io::stdout().is_terminal();
 
-fn walk_dir(
-    dir: &Path,
-    prefix: &str,
-    max_depth: Option<usize>,
-    min_size: u64,
-    sort_by_size: bool,
-    current_depth: usize,
-) -> Result<(), SizeError> {
-    if let Some(max_depth) = max_depth {
-        if current_depth > max_depth {
-            return Ok(());
-        }
-    }
+    let started = Instant::now();
+    let result = progress::run_with_progress(&stats, show_progress, || {
+        scan::scan(&cli.path, &scan_opts, &stats)
+    })
+    .with_context(|| format!("cannot read '{}'", cli.path.display()))?;
+    let elapsed = started.elapsed();
 
-    // Read directory, ignoring errors
-    let entries = match fs::read_dir(dir) {
-        Ok(entries) => {
-            let mut entry_vec = Vec::new();
-            for entry_result in entries {
-                if let Ok(entry) = entry_result {
-                    entry_vec.push(entry);
-                }
-                // Silently ignore entries with errors
-            }
-            entry_vec
-        },
-        Err(err) => return Err(SizeError::IoError(err)), // Only propagate the main error
-    };
-
-    let mut files = Vec::new();
-
-    // Collect all entries
-    for entry in &entries {
-        let path = entry.path();
-        
-        // Ignore files we can't access
-        let metadata = match fs::metadata(&path) {
-            Ok(meta) => meta,
-            Err(_) => continue, // Silently skip this file
-        };
-        
-        let is_dir = metadata.is_dir();
-        let size = if is_dir {
-            match get_size(&path) {
-                Ok(s) => s,
-                Err(_) => 0, // Use 0 as size for directories with errors
-            }
+    let view = ViewOptions {
+        min_size: cli.min_size,
+        top: cli.top,
+        sort: if cli.sort_name {
+            SortKey::Name
         } else {
-            metadata.len()
-        };
-
-        if size < min_size {
-            continue;
-        }
-
-        files.push(FileInfo {
-            path,
-            size,
-            is_dir,
-        });
-    }
-
-    // Sort files by size or name as appropriate
-    if sort_by_size {
-        files.sort_by(|a, b| b.size.cmp(&a.size));
+            cli.sort
+        },
+        reverse: cli.reverse,
+    };
+    let files = stats.files.load(Ordering::Relaxed);
+    let dirs = stats.dirs.load(Ordering::Relaxed);
+    let size_mode = if cli.apparent_size {
+        "apparent size"
     } else {
-        files.sort_by(|a, b| {
-            let a_name = a.path.file_name().unwrap_or_default().to_string_lossy();
-            let b_name = b.path.file_name().unwrap_or_default().to_string_lossy();
-            a_name.cmp(&b_name)
-        });
-    }
+        "disk usage"
+    };
 
-    let total_entries = files.len();
-    for (i, file) in files.iter().enumerate() {
-        let is_last_entry = i == total_entries - 1;
-        let file_name = file.path.file_name().unwrap_or_default().to_string_lossy();
-        
-        // Choose an icon based on file type
-        let icon = if file.is_dir { "📂" } else { "📄" };
-
-        let connector = if is_last_entry {
-            "└── "
-        } else {
-            "├── "
-        };
-
-        // Print the entry with an icon
-        println!(
-            "{}{}{} {} ({})",
-            prefix,
-            connector,
-            icon,
-            file_name,
-            format_size(file.size)
-        );
-
-        // Recurse into directories
-        if file.is_dir {
-            let new_prefix = if is_last_entry {
-                format!("{}    ", prefix)
+    let mut out = BufWriter::new(anstream::stdout().lock());
+    if cli.json {
+        let report = JsonReport {
+            path: &result.root.name,
+            size_mode: if cli.apparent_size {
+                "apparent"
             } else {
-                format!("{}│   ", prefix)
-            };
+                "disk"
+            },
+            size: result.root.size,
+            files,
+            directories: dirs,
+            errors: result.errors.len(),
+            tree: JsonNode {
+                node: &result.root,
+                view: &view,
+            },
+        };
+        serde_json::to_writer_pretty(&mut out, &report).map_err(io::Error::from)?;
+        writeln!(out)?;
+    } else {
+        render::write_tree(
+            &mut out,
+            &result.root,
+            &view,
+            &TextOptions {
+                icons: !cli.no_icons,
+            },
+        )?;
+        writeln!(
+            out,
+            "\n{DIM}{} ({size_mode}) in {} and {}, scanned in {:.2}s{DIM:#}",
+            format_size(result.root.size),
+            plural(files, "file", "files"),
+            plural(dirs, "directory", "directories"),
+            elapsed.as_secs_f64(),
+        )?;
+    }
+    out.flush()?;
 
-            // Silently ignore errors in recursion
-            let _ = walk_dir(
-                &file.path, 
-                &new_prefix, 
-                max_depth, 
-                min_size, 
-                sort_by_size, 
-                current_depth + 1
+    report_errors(&result, cli.verbose);
+    Ok(())
+}
+
+fn report_errors(result: &ScanResult, verbose: bool) {
+    let count = result.errors.len();
+    if count == 0 {
+        return;
+    }
+    if verbose {
+        for e in &result.errors {
+            eprintln!(
+                "{WARNING}warning:{WARNING:#} {}: {}",
+                e.path.display(),
+                e.error
             );
         }
+    } else {
+        eprintln!(
+            "{WARNING}warning:{WARNING:#} {} could not be read, so sizes may be incomplete \
+             (use --verbose to list them)",
+            plural(count as u64, "entry", "entries"),
+        );
     }
-
-    Ok(())
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Parse arguments using clap
-    let args = Args::parse();
-    
-    // Parse the minimum size
-    let min_size = parse_size(&args.min_size)?;
-    
-    let dir = &args.directory;
-    
-    // Verify that the directory is valid
-    if !dir.exists() {
-        return Err(format!("Error: {} does not exist", dir.display()).into());
-    }
-    
-    if !dir.is_dir() {
-        return Err(format!("Error: {} is not a directory", dir.display()).into());
-    }
-    
-    // Get and display the root directory size
-    match get_size(dir) {
-        Ok(root_size) => {
-            println!("{} ({})", dir.display(), format_size(root_size));
-            
-            // Skip displaying the tree if the root directory is smaller than min_size
-            if root_size < min_size {
-                println!("No entries meet the minimum size criteria.");
-                return Ok(());
-            }
-            
-            // Display the tree and silently ignore errors
-            let _ = walk_dir(dir, "", args.depth, min_size, !args.sort_name, 0);
-        },
-        Err(err) => {
-            return Err(Box::new(err));
-        }
-    }
-    
-    Ok(())
+fn plural(count: u64, one: &str, many: &str) -> String {
+    format!(
+        "{} {}",
+        group_digits(count),
+        if count == 1 { one } else { many }
+    )
+}
+
+fn is_broken_pipe(err: &anyhow::Error) -> bool {
+    err.chain()
+        .filter_map(|e| e.downcast_ref::<io::Error>())
+        .any(|e| e.kind() == io::ErrorKind::BrokenPipe)
 }
